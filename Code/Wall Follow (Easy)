@@ -1,0 +1,92 @@
+#include "rclcpp/rclcpp.hpp"
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "ackermann_msgs/msg/ackermann_drive_stamped.hpp"
+
+class WallFollow : public rclcpp::Node {
+public:
+    WallFollow() : Node("wall_follow_node") {
+        publisher_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>("/drive", 10);
+        subscription_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+            "/scan", 10, std::bind(&WallFollow::scan_callback, this, std::placeholders::_1));
+    }
+
+private:
+    double kp = 0.7; 
+    double kd = 0.15; 
+    double prev_error = 0.0;
+    double desired_distance = 0.8;
+    double look_ahead_dist = 0.4;
+
+    double get_range(const std::vector<float>& range_data, double angle_deg, 
+                     const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg) {
+        double angle_rad = angle_deg * M_PI / 180.0;
+        int index = (angle_rad - scan_msg->angle_min) / scan_msg->angle_increment;
+        if (index >= 0 && index < (int)range_data.size()) {
+            float range = range_data[index];
+            if (std::isnan(range) || std::isinf(range) || range > 5.0) return 5.0;
+            return (double)range;
+        }
+        return 5.0;
+    }
+
+    void scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg) {
+        double front = get_range(scan_msg->ranges, 0.0, scan_msg);
+        double left_90 = get_range(scan_msg->ranges, 90.0, scan_msg);
+        double right_45 = get_range(scan_msg->ranges, -45.0, scan_msg);
+        double right_90 = get_range(scan_msg->ranges, -90.0, scan_msg);
+        
+        double steer_angle = 0.0;
+        double velocity = 3.0;
+
+        if (front < 1.0) {
+            steer_angle = (left_90 > right_90) ? 0.45 : -0.45;
+            velocity = 2.0;
+        }
+        else if (front < 1.8) {
+            steer_angle = (left_90 > right_90) ? 0.4 : -0.4;
+            velocity = 3.0;
+        }
+        else {
+            double theta = 45.0 * M_PI / 180.0;
+            double a = right_45;
+            double b = right_90;
+            double alpha = std::atan((a * std::cos(theta) - b) / (a * std::sin(theta)));
+            double current_dist = b * std::cos(alpha);
+            double projected_dist = current_dist + look_ahead_dist * std::sin(alpha);
+            double error = desired_distance - projected_dist;
+            
+            steer_angle = kp * error + kd * (error - prev_error);
+            prev_error = error;
+            
+            double abs_steer = std::abs(steer_angle);
+            if (abs_steer < 0.1) {
+                velocity = 4.5;
+            } else if (abs_steer < 0.2) {
+                velocity = 4.0;
+            } else {
+                velocity = 3.5;
+            }
+        }
+
+        steer_angle = std::clamp(steer_angle, -0.45, 0.45);
+
+        auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
+        drive_msg.header.stamp = this->now();
+        drive_msg.drive.speed = velocity;
+        drive_msg.drive.steering_angle = steer_angle;
+        publisher_->publish(drive_msg);
+    }
+
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr subscription_;
+    rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr publisher_;
+};
+
+int main(int argc, char ** argv) {
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<WallFollow>());
+    rclcpp::shutdown();
+    return 0;
+}

@@ -1,0 +1,306 @@
+#include "rclcpp/rclcpp.hpp"
+
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "ackermann_msgs/msg/ackermann_drive_stamped.hpp"
+
+class ReactiveFollowGap : public rclcpp::Node {
+
+public:
+
+ReactiveFollowGap() : Node("reactive_node")
+{
+    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+        lidarscan_topic, 10,
+        std::bind(&ReactiveFollowGap::lidar_callback, this, std::placeholders::_1));
+    drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(
+        drive_topic, 10);
+}
+
+private:
+std::string lidarscan_topic = "/scan";
+std::string drive_topic = "/drive";
+rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_pub_;
+
+// 파라미터
+const double BUBBLE_RADIUS = 0.40;
+const int WINDOW_SIZE = 7;
+const double MAX_RANGE = 5.0;
+const double MIN_RANGE = 0.1;
+const double FOV_ANGLE = 100.0 * M_PI / 180.0;
+
+// 스티어링 필터
+float prev_steering_ = 0.0f;
+const float STEERING_SMOOTHING = 0.8f;
+
+void preprocess_lidar(std::vector<float>& ranges, float angle_increment)
+{
+    int n = ranges.size();
+    for (int i = 0; i < n; i++) {
+        if (std::isinf(ranges[i]) || std::isnan(ranges[i])) {
+            ranges[i] = MAX_RANGE;
+        }
+        ranges[i] = std::clamp(ranges[i], (float)MIN_RANGE, (float)MAX_RANGE);
+    }
+
+    std::vector<float> smoothed(n);
+    int half_window = WINDOW_SIZE / 2;
+    for (int i = 0; i < n; i++) {
+        float sum = 0.0f;
+        int count = 0;
+        for (int j = -half_window; j <= half_window; j++) {
+            int idx = i + j;
+            if (idx >= 0 && idx < n) {
+                sum += ranges[idx];
+                count++;
+            }
+        }
+        smoothed[i] = sum / count;
+    }
+    ranges = smoothed;
+}
+
+void set_bubble(std::vector<float>& ranges, int closest_idx, float angle_increment)
+{
+    float closest_dist = ranges[closest_idx];
+    int bubble_points = 0;
+    if (closest_dist > 0.01) {
+        float bubble_angle = std::atan(BUBBLE_RADIUS / closest_dist);
+        bubble_points = static_cast<int>(bubble_angle / angle_increment);
+    } else {
+        bubble_points = 50;
+    }
+
+    bubble_points = static_cast<int>(bubble_points * 1.2);
+    int start = std::max(0, closest_idx - bubble_points);
+    int end = std::min((int)ranges.size() - 1, closest_idx + bubble_points);
+
+    for (int i = start; i <= end; i++) {
+        ranges[i] = 0.0f;
+    }
+}
+
+void extend_disparities(std::vector<float>& ranges, float angle_increment)
+{
+    const float DISPARITY_THRESHOLD = 0.5f;
+    int n = ranges.size();
+    std::vector<float> extended = ranges;
+
+    for (int i = 1; i < n; i++) {
+        float diff = ranges[i] - ranges[i-1];
+        if (std::abs(diff) > DISPARITY_THRESHOLD) {
+            float closer_dist = std::min(ranges[i], ranges[i-1]);
+            int extend_points = 0;
+            if (closer_dist > 0.01) {
+                float extend_angle = std::atan(BUBBLE_RADIUS / closer_dist);
+                extend_points = static_cast<int>(extend_angle / angle_increment);
+            }
+            extend_points = std::min(extend_points, 50);
+            extend_points = static_cast<int>(extend_points * 1.3);
+
+            if (diff > 0) {
+                for (int j = 0; j < extend_points && (i + j) < n; j++) {
+                    extended[i + j] = std::min(extended[i + j], closer_dist);
+                }
+            } else {
+                for (int j = 0; j < extend_points && (i - 1 - j) >= 0; j++) {
+                    extended[i - 1 - j] = std::min(extended[i - 1 - j], closer_dist);
+                }
+            }
+        }
+    }
+    ranges = extended;
+}
+
+std::pair<int, int> find_max_gap(const std::vector<float>& ranges, int start_idx, int end_idx)
+{
+    int max_start = start_idx;
+    int max_end = start_idx;
+    int max_length = 0;
+    int current_start = -1;
+    const float GAP_THRESHOLD = 0.3f;
+
+    for (int i = start_idx; i <= end_idx; i++) {
+        if (ranges[i] > GAP_THRESHOLD) {
+            if (current_start == -1) {
+                current_start = i;
+            }
+        } else {
+            if (current_start != -1) {
+                int length = i - current_start;
+                if (length > max_length) {
+                    max_length = length;
+                    max_start = current_start;
+                    max_end = i - 1;
+                }
+                current_start = -1;
+            }
+        }
+    }
+
+    if (current_start != -1) {
+        int length = end_idx - current_start + 1;
+        if (length > max_length) {
+            max_start = current_start;
+            max_end = end_idx;
+        }
+    }
+
+    return {max_start, max_end};
+}
+
+int find_best_point(const std::vector<float>& ranges, int start_idx, int end_idx, int center_idx)
+{
+    int best_idx = (start_idx + end_idx) / 2;
+    float best_score = -1.0f;
+    int gap_mid = (start_idx + end_idx) / 2;
+
+    for (int i = start_idx; i <= end_idx; i++) {
+        float distance_score = std::sqrt(ranges[i]);
+        float gap_offset = std::abs(i - gap_mid) / (float)std::max(1, end_idx - start_idx);
+        float gap_center_score = 1.0f - 0.4f * gap_offset;
+        float center_offset = std::abs(i - center_idx) / (float)center_idx;
+        float center_score = std::exp(-1.5f * center_offset);
+        float local_safety = calculate_local_safety(ranges, i, start_idx, end_idx);
+
+        float score = distance_score * 1.0f + 
+                     gap_center_score * 1.2f + 
+                     center_score * 0.8f + 
+                     local_safety * 1.5f;
+
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    return best_idx;
+}
+
+float calculate_local_safety(const std::vector<float>& ranges, int idx, int start_idx, int end_idx)
+{
+    const int SAFETY_WINDOW = 20;
+    float min_dist = MAX_RANGE;
+    int window_start = std::max(start_idx, idx - SAFETY_WINDOW);
+    int window_end = std::min(end_idx, idx + SAFETY_WINDOW);
+
+    for (int i = window_start; i <= window_end; i++) {
+        min_dist = std::min(min_dist, ranges[i]);
+    }
+
+    if (min_dist < 0.5f) return 0.1f;
+    if (min_dist < 1.0f) return 0.5f;
+    if (min_dist < 1.5f) return 0.8f;
+    return 1.0f;
+}
+
+void lidar_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg)
+{
+    std::vector<float> ranges(scan_msg->ranges.begin(), scan_msg->ranges.end());
+    int n = ranges.size();
+    float angle_increment = scan_msg->angle_increment;
+    float angle_min = scan_msg->angle_min;
+    int center_idx = n / 2;
+
+    int fov_half_points = static_cast<int>(FOV_ANGLE / angle_increment);
+    int start_idx = std::max(0, center_idx - fov_half_points);
+    int end_idx = std::min(n - 1, center_idx + fov_half_points);
+
+    preprocess_lidar(ranges, angle_increment);
+
+    // 가장 가까운 장애물
+    int closest_idx = start_idx;
+    float closest_dist = ranges[start_idx];
+    for (int i = start_idx; i <= end_idx; i++) {
+        if (ranges[i] < closest_dist) {
+            closest_dist = ranges[i];
+            closest_idx = i;
+        }
+    }
+
+    // 좌우 거리 체크
+    int left_check_offset = static_cast<int>((M_PI / 4) / angle_increment);
+    int right_check_offset = static_cast<int>((M_PI / 4) / angle_increment);
+    int left_idx = std::min(n - 1, center_idx + left_check_offset);
+    int right_idx = std::max(0, center_idx - right_check_offset);
+    float left_dist = ranges[left_idx];
+    float right_dist = ranges[right_idx];
+
+    set_bubble(ranges, closest_idx, angle_increment);
+    extend_disparities(ranges, angle_increment);
+
+    auto [gap_start, gap_end] = find_max_gap(ranges, start_idx, end_idx);
+    int best_idx = find_best_point(ranges, gap_start, gap_end, center_idx);
+
+    float target_angle = angle_min + best_idx * angle_increment;
+
+    // 좌우 불균형 보정
+    if (right_dist < 0.8f && left_dist > 1.5f) {
+        target_angle += 0.05f;
+    } else if (left_dist < 0.8f && right_dist > 1.5f) {
+        target_angle -= 0.05f;
+    }
+
+    // 스티어링 스무딩
+    float raw_steering = target_angle;
+    float steering_angle = STEERING_SMOOTHING * prev_steering_ + (1.0f - STEERING_SMOOTHING) * raw_steering;
+    prev_steering_ = steering_angle;
+
+    const float MAX_STEERING = 0.40f;
+    steering_angle = std::clamp(steering_angle, -MAX_STEERING, MAX_STEERING);
+
+    // 속도 결정
+    float velocity;
+    float abs_steering = std::abs(steering_angle);
+    float front_dist = ranges[best_idx];
+
+    if (abs_steering > 0.30f) {
+        velocity = 4.0f;
+    } else if (abs_steering > 0.20f) {
+        velocity = 5.5f;
+    } else if (abs_steering > 0.12f) {
+        velocity = 6.5f;
+    } else if (abs_steering > 0.06f) {
+        velocity = 7.5f;
+    } else {
+        velocity = 8.5f;
+    }
+
+    if (front_dist < 1.5f) {
+        velocity *= 0.65f;
+    } else if (front_dist < 2.5f) {
+        velocity *= 0.8f;
+    } else if (front_dist < 3.5f) {
+        velocity *= 0.9f;
+    }
+
+    int gap_size = gap_end - gap_start;
+    if (gap_size < 30) {
+        velocity *= 0.8f;
+    } else if (gap_size < 50) {
+        velocity *= 0.9f;
+    }
+
+    velocity = std::max(velocity, 2.5f);
+
+    auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
+    drive_msg.header.stamp = this->now();
+    drive_msg.header.frame_id = "base_link";
+    drive_msg.drive.steering_angle = steering_angle;
+    drive_msg.drive.speed = velocity;
+    drive_pub_->publish(drive_msg);
+}
+
+};
+
+int main(int argc, char ** argv) {
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<ReactiveFollowGap>());
+    rclcpp::shutdown();
+    return 0;
+}
